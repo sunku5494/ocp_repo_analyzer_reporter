@@ -27,22 +27,25 @@ import (
 
 // Configuration holds the application configuration
 type Config struct {
-	PackageName    string
-	ReleaseURL     string
-	OutputCSV      string
-	AnalyzerPath   string
-	Workers        int
-	FileWorkers    int
-	SkipAnalysis   bool
-	ForceRerun     bool
-	CSVOnly        string
-	ExtractCode    bool
-	SignaturesOnly bool
-	Progress       bool
-	LogFile        string
-	VerboseLogging bool
-	DebugMode      bool
-	OutputDir      string
+	PackageName      string
+	ReleaseURL       string
+	ReleaseBranch    string
+	SingleRepoURL    string
+	SingleRepoBranch string
+	OutputCSV        string
+	AnalyzerPath     string
+	Workers          int
+	FileWorkers      int
+	SkipAnalysis     bool
+	ForceRerun       bool
+	CSVOnly          string
+	ExtractCode      bool
+	SignaturesOnly   bool
+	Progress         bool
+	LogFile          string
+	VerboseLogging   bool
+	DebugMode        bool
+	OutputDir        string
 }
 
 // Logger provides thread-safe logging with timestamps
@@ -161,6 +164,15 @@ type TestCase struct {
 	InitialCloneDuration time.Duration `csv:"-"`
 }
 
+// PackageResult represents analysis result for a package
+type PackageResult struct {
+	Package          string   `json:"package"`
+	DirectDependency bool     `json:"directdependency"`
+	Vendored         bool     `json:"vendored"`
+	ImpactedFiles    []string `json:"impactedfiles"`
+	UsedSymbols      []string `json:"usedsymbols"`
+}
+
 // AnalysisResult represents the result of analyzing a single repository
 type AnalysisResult struct {
 	TestCase      TestCase
@@ -178,13 +190,97 @@ type PipelineSummary struct {
 	Failed  int
 }
 
-// PackageResult represents analysis result for a package
-type PackageResult struct {
-	Package          string   `json:"package"`
-	DirectDependency bool     `json:"directdependency"`
-	Vendored         bool     `json:"vendored"`
-	ImpactedFiles    []string `json:"impactedfiles"`
-	UsedSymbols      []string `json:"usedsymbols"`
+// deduplicatePackageResults removes duplicate packages and deduplicates impacted files within each package.
+//
+// This function addresses the issue where repo_analyzer may return duplicate packages:
+// - A package can appear in both directImporters and impactedMainModules
+// - A package can be both in vendor and in main module packages
+//
+// Deduplication strategy:
+// 1. Use package import path as the unique key
+// 2. Merge duplicate packages:
+//   - DirectDependency: true if ANY instance is a direct dependency
+//   - Vendored: true if ANY instance is vendored
+//   - ImpactedFiles: union of all impacted files (deduplicated)
+//   - UsedSymbols: union of all used symbols (deduplicated)
+//
+// 3. Within each package, deduplicate impacted files and symbols
+//
+// This ensures accurate counts for:
+// - Total Packages Found
+// - Total Impacted Files
+// - Total Unique Symbols
+func deduplicatePackageResults(results []PackageResult) []PackageResult {
+	packageMap := make(map[string]*PackageResult)
+
+	for _, pkg := range results {
+		if existing, exists := packageMap[pkg.Package]; exists {
+			// Merge with existing package
+			// Keep DirectDependency as true if either is true
+			existing.DirectDependency = existing.DirectDependency || pkg.DirectDependency
+			// Keep Vendored as true if either is true
+			existing.Vendored = existing.Vendored || pkg.Vendored
+
+			// Deduplicate and merge impacted files
+			fileSet := make(map[string]struct{})
+			for _, file := range existing.ImpactedFiles {
+				fileSet[file] = struct{}{}
+			}
+			for _, file := range pkg.ImpactedFiles {
+				fileSet[file] = struct{}{}
+			}
+			existing.ImpactedFiles = make([]string, 0, len(fileSet))
+			for file := range fileSet {
+				existing.ImpactedFiles = append(existing.ImpactedFiles, file)
+			}
+
+			// Deduplicate and merge used symbols
+			symbolSet := make(map[string]struct{})
+			for _, symbol := range existing.UsedSymbols {
+				symbolSet[symbol] = struct{}{}
+			}
+			for _, symbol := range pkg.UsedSymbols {
+				symbolSet[symbol] = struct{}{}
+			}
+			existing.UsedSymbols = make([]string, 0, len(symbolSet))
+			for symbol := range symbolSet {
+				existing.UsedSymbols = append(existing.UsedSymbols, symbol)
+			}
+		} else {
+			// New package - deduplicate its files and symbols
+			pkgCopy := pkg
+
+			// Deduplicate impacted files
+			fileSet := make(map[string]struct{})
+			for _, file := range pkg.ImpactedFiles {
+				fileSet[file] = struct{}{}
+			}
+			pkgCopy.ImpactedFiles = make([]string, 0, len(fileSet))
+			for file := range fileSet {
+				pkgCopy.ImpactedFiles = append(pkgCopy.ImpactedFiles, file)
+			}
+
+			// Deduplicate used symbols
+			symbolSet := make(map[string]struct{})
+			for _, symbol := range pkg.UsedSymbols {
+				symbolSet[symbol] = struct{}{}
+			}
+			pkgCopy.UsedSymbols = make([]string, 0, len(symbolSet))
+			for symbol := range symbolSet {
+				pkgCopy.UsedSymbols = append(pkgCopy.UsedSymbols, symbol)
+			}
+
+			packageMap[pkg.Package] = &pkgCopy
+		}
+	}
+
+	// Convert map back to slice
+	dedupedResults := make([]PackageResult, 0, len(packageMap))
+	for _, pkg := range packageMap {
+		dedupedResults = append(dedupedResults, *pkg)
+	}
+
+	return dedupedResults
 }
 
 // WorkerPool manages concurrent repository processing
@@ -227,16 +323,39 @@ func NewIntegratedAnalyzer(config *Config) *IntegratedAnalyzer {
 		log.Fatalf("Failed to get current working directory: %v", err)
 	}
 
-	branchSuffix := ""
-	releaseBranch := parseBranchFromURL(config.ReleaseURL)
-	if releaseBranch != "" && releaseBranch != "unknown-branch" {
-		branchSafe := sanitizeForFilename(releaseBranch)
-		if branchSafe != "" {
-			branchSuffix = fmt.Sprintf("_%s", branchSafe)
-		}
+	releaseBranch := strings.TrimSpace(config.ReleaseBranch)
+	if releaseBranch == "" {
+		releaseBranch = parseBranchFromURL(config.ReleaseURL)
+	}
+	if (releaseBranch == "" || releaseBranch == "unknown-branch") && strings.TrimSpace(config.SingleRepoBranch) != "" {
+		releaseBranch = strings.TrimSpace(config.SingleRepoBranch)
 	}
 
-	tempDir := filepath.Join(cwd, fmt.Sprintf("temp_repos%s_%d", branchSuffix, time.Now().UnixNano()))
+	targetPackage := strings.TrimSpace(config.PackageName)
+	if targetPackage == "" {
+		targetPackage = "package"
+	}
+	packageParts := strings.Split(targetPackage, "/")
+	packageSegment := packageParts[len(packageParts)-1]
+	packageSafe := sanitizeForFilename(packageSegment)
+	if packageSafe == "" {
+		packageSafe = "package"
+	}
+
+	releaseSegment := strings.TrimSpace(releaseBranch)
+	if releaseSegment == "" {
+		releaseSegment = "unknown-branch"
+	}
+	releaseSafe := sanitizeForFilename(releaseSegment)
+	if releaseSafe == "" {
+		releaseSafe = "unknown-branch"
+	}
+
+	tempDirName := fmt.Sprintf("temp_repos_%s_%s", packageSafe, releaseSafe)
+	tempDir := filepath.Join(cwd, tempDirName)
+	if _, err := os.Stat(tempDir); err == nil {
+		tempDir = fmt.Sprintf("%s_%d", tempDir, time.Now().UnixNano())
+	}
 
 	if strings.TrimSpace(config.OutputDir) == "" {
 		config.OutputDir = filepath.Join(tempDir, "analysis_outputs")
@@ -250,7 +369,7 @@ func NewIntegratedAnalyzer(config *Config) *IntegratedAnalyzer {
 		log.Fatalf("Failed to create temp directory: %v", err)
 	}
 
-	fmt.Printf("📁 Created temporary directory: %s\n", tempDir)
+	fmt.Printf(" Created temporary directory: %s\n", tempDir)
 
 	// Create cleanup function
 	cleanupFunc := func() {
@@ -331,6 +450,31 @@ func (ia *IntegratedAnalyzer) Run() error {
 	fmt.Printf("Workers: %d\n", ia.config.Workers)
 	fmt.Printf("Temp Directory: %s\n", ia.tempDir)
 	fmt.Printf("Output Directory: %s\n", outputDir)
+	if strings.TrimSpace(ia.config.SingleRepoURL) != "" {
+		fmt.Printf("Single Repo URL: %s\n", ia.config.SingleRepoURL)
+		if strings.TrimSpace(ia.config.SingleRepoBranch) != "" {
+			fmt.Printf("Single Repo Branch: %s\n", ia.config.SingleRepoBranch)
+		}
+	}
+
+	if strings.TrimSpace(ia.config.SingleRepoURL) != "" {
+		summary, csvFile, analysisDuration, err := ia.runSingleRepo()
+		if err != nil {
+			return err
+		}
+
+		ia.logger.Printf("\n=== SINGLE REPOSITORY SUMMARY ===\n")
+		ia.logger.Printf("✓ Processed %d repositories (%d succeeded, %d failed) in %v\n",
+			summary.Total, summary.Success, summary.Failed, analysisDuration)
+		ia.logger.Printf("✓ CSV saved to: %s\n", csvFile)
+
+		totalDuration := time.Since(start)
+		ia.logger.Printf("\n⏱️  Total Workflow Time: %v\n", totalDuration)
+		if totalDuration.Minutes() > 0 {
+			ia.logger.Printf("📊 Performance: %.2f repos/min\n", float64(summary.Total)*60.0/totalDuration.Minutes())
+		}
+		return nil
+	}
 
 	if ia.config.CSVOnly != "" {
 		fmt.Println("\n=== ANALYSIS-ONLY MODE ===")
@@ -342,9 +486,9 @@ func (ia *IntegratedAnalyzer) Run() error {
 		ia.logger.Printf("✓ Analysis completed in %v\n", analysisDuration)
 
 		totalDuration := time.Since(start)
-		ia.logger.Printf("\n⏱️  Total Workflow Time: %v\n", totalDuration)
+		ia.logger.Printf("\n  Total Workflow Time: %v\n", totalDuration)
 		if totalDuration.Minutes() > 0 {
-			ia.logger.Printf("📊 Performance: %.2f repos/min\n", float64(ia.config.Workers)*60.0/totalDuration.Minutes())
+			ia.logger.Printf(" Performance: %.2f repos/min\n", float64(ia.config.Workers)*60.0/totalDuration.Minutes())
 		}
 		return nil
 	}
@@ -456,7 +600,7 @@ func (ia *IntegratedAnalyzer) Run() error {
 
 	analysisDuration := time.Since(analysisStart)
 	if err := file.Sync(); err != nil {
-		fmt.Printf("⚠️  Failed to sync CSV to disk: %v\n", err)
+		fmt.Printf("  Failed to sync CSV to disk: %v\n", err)
 	}
 
 	ia.logger.Printf("✓ Found %d Go projects in %v\n", tcSummary.count, scrapingDuration)
@@ -466,12 +610,200 @@ func (ia *IntegratedAnalyzer) Run() error {
 	ia.logger.Printf("✓ CSV saved to: %s\n", csvFile)
 
 	totalDuration := time.Since(start)
-	ia.logger.Printf("\n⏱️  Total Workflow Time: %v\n", totalDuration)
+	ia.logger.Printf("\n  Total Workflow Time: %v\n", totalDuration)
 	if totalDuration.Minutes() > 0 {
-		ia.logger.Printf("📊 Performance: %.2f repos/min\n", float64(ia.config.Workers)*60.0/totalDuration.Minutes())
+		ia.logger.Printf(" Performance: %.2f repos/min\n", float64(ia.config.Workers)*60.0/totalDuration.Minutes())
 	}
 
 	return nil
+}
+
+func (ia *IntegratedAnalyzer) runSingleRepo() (PipelineSummary, string, time.Duration, error) {
+	repoURL := strings.TrimSpace(ia.config.SingleRepoURL)
+	if repoURL == "" {
+		return PipelineSummary{}, "", 0, fmt.Errorf("single repository URL is required")
+	}
+
+	normalizedURL := ia.extractBaseRepositoryURL(repoURL)
+	if normalizedURL != "" {
+		repoURL = normalizedURL
+	}
+
+	fmt.Println("\n=== SINGLE REPOSITORY MODE ===")
+	fmt.Printf("Analyzing repository: %s\n", repoURL)
+	branchHint := strings.TrimSpace(ia.config.SingleRepoBranch)
+	if branchHint != "" {
+		fmt.Printf("Requested branch: %s\n", branchHint)
+	}
+
+	project, err := ia.inspectSingleRepository(repoURL, branchHint)
+	if err != nil {
+		return PipelineSummary{}, "", 0, err
+	}
+	if !project.IsGoProject {
+		return PipelineSummary{}, "", 0, fmt.Errorf("repository %s does not appear to contain Go modules or non-vendored Go code", repoURL)
+	}
+
+	testCase := ia.buildTestCaseFromProject(project)
+	testCase.Branch = project.SelectedBranch
+
+	if ia.config.Progress {
+		ia.logger.Printf("Prepared single repository test case: Component=%s, Branch=%s\n",
+			testCase.Component, testCase.Branch)
+	}
+
+	csvFile := ia.config.OutputCSV
+	if strings.TrimSpace(csvFile) == "" {
+		csvFile = fmt.Sprintf("single_repo_test_cases_%d.csv", time.Now().Unix())
+	}
+
+	file, err := os.Create(csvFile)
+	if err != nil {
+		return PipelineSummary{}, "", 0, fmt.Errorf("failed to create CSV: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	header := []string{
+		"S.No.", "component", "branch", "pkg", "progress", "workers", "file-workers", "extract-code",
+		"output-file", "signatures-only", "Go.mod Detected", "Go Module Count",
+		"Impacted", "Total Packages Found", "Direct Dependencies", "Vendored Dependencies",
+		"Total Impacted Files", "Total Unique Symbols", "Clone Duration", "Execution Time", "Analysis Rate",
+	}
+	if err := writer.Write(header); err != nil {
+		return PipelineSummary{}, "", 0, fmt.Errorf("failed to write CSV header: %w", err)
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return PipelineSummary{}, "", 0, fmt.Errorf("failed to flush CSV header: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	analysisStart := time.Now()
+
+	testCaseCh := make(chan TestCase, 1)
+	resultsCh := ia.analyzeStream(ctx, testCaseCh)
+
+	testCaseCh <- testCase
+	close(testCaseCh)
+
+	summary, err := ia.writeResultsToCSV(writer, resultsCh)
+	analysisDuration := time.Since(analysisStart)
+	if err != nil {
+		return PipelineSummary{}, "", analysisDuration, fmt.Errorf("failed to write CSV: %w", err)
+	}
+
+	if err := file.Sync(); err != nil {
+		fmt.Printf("⚠️  Failed to sync CSV to disk: %v\n", err)
+	}
+
+	return summary, csvFile, analysisDuration, nil
+}
+
+func (ia *IntegratedAnalyzer) inspectSingleRepository(repoURL, branchHint string) (GoProject, error) {
+	normalizedURL := ia.extractBaseRepositoryURL(repoURL)
+	if normalizedURL != "" {
+		repoURL = normalizedURL
+	}
+
+	workCtx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+
+	candidates := ia.branchCandidates(branchHint)
+	if len(candidates) == 0 {
+		candidates = []string{"main", "master"}
+	}
+
+	checked := make([]string, 0, len(candidates))
+	var lastErr error
+	var repoPath string
+	var selectedBranch string
+	var cloneDuration time.Duration
+
+	for _, candidate := range candidates {
+		checked = append(checked, candidate)
+
+		cacheKey := repoCacheKey(repoURL, candidate)
+		ia.cloneCacheMux.RLock()
+		cachedPath, exists := ia.cloneCache[cacheKey]
+		ia.cloneCacheMux.RUnlock()
+		if exists && strings.TrimSpace(cachedPath) != "" {
+			repoPath = cachedPath
+			selectedBranch = candidate
+			cloneDuration = 0
+			if ia.config != nil && ia.config.Progress {
+				ia.logger.Printf("Using cached clone for %s (%s): %s\n", repoURL, candidate, cachedPath)
+			}
+			break
+		}
+
+		cloneStart := time.Now()
+		path, err := ia.cloneRepositoryForInspection(workCtx, repoURL, candidate)
+		duration := time.Since(cloneStart)
+		if err != nil {
+			lastErr = err
+			if ia.config != nil && ia.config.Progress {
+				ia.logger.Printf("Single repo clone failed for %s (%s): %v\n", repoURL, candidate, err)
+			}
+			continue
+		}
+
+		repoPath = path
+		selectedBranch = candidate
+		cloneDuration = duration
+		break
+	}
+
+	if repoPath == "" {
+		if lastErr == nil {
+			lastErr = fmt.Errorf("no clone candidates succeeded")
+		}
+		return GoProject{}, fmt.Errorf("failed to clone %s (branches tried: %s): %w",
+			repoURL, strings.Join(checked, ", "), lastErr)
+	}
+
+	filePaths, err := ia.listRepositoryFiles(workCtx, repoPath)
+	if err != nil {
+		return GoProject{}, fmt.Errorf("failed to list repository files: %w", err)
+	}
+
+	goModPaths := findGoModulesInTree(filePaths)
+
+	project := GoProject{
+		Name:                 ia.extractRepoName(repoURL),
+		RepoURL:              repoURL,
+		GoModuleCount:        len(goModPaths),
+		GoModPaths:           goModPaths,
+		BranchesChecked:      append([]string(nil), checked...),
+		SelectedBranch:       selectedBranch,
+		ClonePath:            repoPath,
+		InitialCloneDuration: cloneDuration,
+	}
+
+	if project.Name == "unknown-repo" || !ia.isValidComponentName(project.Name) {
+		return GoProject{}, fmt.Errorf("invalid component name derived from %s", repoURL)
+	}
+
+	if len(goModPaths) > 0 && ia.isValidGoProject(goModPaths) {
+		project.IsGoProject = true
+		project.GoModDetected = true
+	} else if ia.hasSubstantialGoCode(filePaths) {
+		project.IsGoProject = true
+		project.GoModDetected = false
+	}
+
+	if project.IsGoProject {
+		ia.storeClonePath(repoURL, selectedBranch, repoPath)
+	}
+
+	if ia.config != nil && ia.config.Progress {
+		ia.logger.Printf("Single repo inspection: Component=%s, Branch=%s, GoModDetected=%t, Modules=%d\n",
+			project.Name, project.SelectedBranch, project.GoModDetected, project.GoModuleCount)
+	}
+
+	return project, nil
 }
 
 // scrapeWithFanOut performs web scraping with concurrent repository analysis
@@ -1236,9 +1568,19 @@ func (wp *WorkerPool) processTestCaseWithLogging(workerID int, execID string, te
 		return result
 	}
 
+	// Deduplicate packages and their impacted files
+	originalPackageCount := len(analysisResults)
+	analysisResults = deduplicatePackageResults(analysisResults)
+	totalPackages = len(analysisResults)
+
 	if wp.config.Progress {
-		wp.logger.Printf("[%s] Analysis: ✓ Success, Packages=%d, Duration=%.2fs\n",
-			execID, totalPackages, execDuration.Seconds())
+		if originalPackageCount != totalPackages {
+			wp.logger.Printf("[%s] Analysis: ✓ Success, Packages=%d (deduplicated from %d), Duration=%.2fs\n",
+				execID, totalPackages, originalPackageCount, execDuration.Seconds())
+		} else {
+			wp.logger.Printf("[%s] Analysis: ✓ Success, Packages=%d, Duration=%.2fs\n",
+				execID, totalPackages, execDuration.Seconds())
+		}
 	}
 
 	result.Results = analysisResults
@@ -2012,13 +2354,16 @@ func decorateTestCaseWithResult(result *AnalysisResult) {
 	result.CloneDuration = effectiveClone
 
 	if result.Success {
+		// Deduplicate packages and their impacted files
+		dedupedResults := deduplicatePackageResults(result.Results)
+
 		directDeps := 0
 		vendoredDeps := 0
 		totalFiles := 0
 		symbolSet := make(map[string]bool)
 		impacted := false
 
-		for _, pkg := range result.Results {
+		for _, pkg := range dedupedResults {
 			if pkg.DirectDependency {
 				directDeps++
 			}
@@ -2033,6 +2378,9 @@ func decorateTestCaseWithResult(result *AnalysisResult) {
 				impacted = true
 			}
 		}
+
+		// Update TotalPackages with deduplicated count
+		result.TotalPackages = len(dedupedResults)
 
 		testCase.Impacted = "FALSE"
 		if impacted {
@@ -2165,7 +2513,7 @@ func (ia *IntegratedAnalyzer) generateCSV(goProjects []GoProject) (string, error
 
 		// Validate component name before adding to CSV
 		if !ia.isValidComponentName(componentName) {
-			fmt.Printf("  ⚠️  Warning: Invalid component name '%s' from URL '%s' - skipping\n", componentName, project.RepoURL)
+			fmt.Printf("  Warning: Invalid component name '%s' from URL '%s' - skipping\n", componentName, project.RepoURL)
 			continue
 		}
 
@@ -2281,12 +2629,15 @@ func (ia *IntegratedAnalyzer) updateCSVWithResults(csvFile string, results []Ana
 		}
 
 		if result.Success {
+			// Deduplicate packages and their impacted files
+			dedupedResults := deduplicatePackageResults(result.Results)
+
 			// Calculate metrics
 			var directDeps, vendoredDeps, totalFiles, totalSymbols int
 			symbolSet := make(map[string]bool)
 			impacted := false
 
-			for _, pkg := range result.Results {
+			for _, pkg := range dedupedResults {
 				if pkg.DirectDependency {
 					directDeps++
 				}
@@ -2305,6 +2656,9 @@ func (ia *IntegratedAnalyzer) updateCSVWithResults(csvFile string, results []Ana
 			}
 
 			totalSymbols = len(symbolSet)
+
+			// Update TotalPackages with deduplicated count
+			result.TotalPackages = len(dedupedResults)
 
 			// Update test case with results
 			if impacted {
@@ -2407,6 +2761,16 @@ func main() {
 				config.ReleaseURL = args[i+1]
 				i++
 			}
+		case "--repo-url":
+			if i+1 < len(args) {
+				config.SingleRepoURL = args[i+1]
+				i++
+			}
+		case "--repo-branch":
+			if i+1 < len(args) {
+				config.SingleRepoBranch = args[i+1]
+				i++
+			}
 		case "--output", "-o":
 			if i+1 < len(args) {
 				config.OutputCSV = args[i+1]
@@ -2459,6 +2823,29 @@ func main() {
 		}
 	}
 
+	config.SingleRepoURL = strings.TrimSpace(config.SingleRepoURL)
+	config.SingleRepoBranch = strings.TrimSpace(config.SingleRepoBranch)
+	config.ReleaseBranch = strings.TrimSpace(config.ReleaseBranch)
+
+	if config.ReleaseBranch == "" {
+		config.ReleaseBranch = parseBranchFromURL(config.ReleaseURL)
+	}
+	if (config.ReleaseBranch == "" || config.ReleaseBranch == "unknown-branch") && config.SingleRepoBranch != "" {
+		config.ReleaseBranch = config.SingleRepoBranch
+	}
+
+	if config.SingleRepoURL != "" && config.CSVOnly != "" {
+		fmt.Println("Error: --repo-url cannot be combined with --csv-only")
+		printUsage()
+		os.Exit(1)
+	}
+
+	if config.SingleRepoURL == "" && config.ReleaseURL == "" && config.CSVOnly == "" {
+		fmt.Println("Error: Release URL or --repo-url is required")
+		printUsage()
+		os.Exit(1)
+	}
+
 	if config.SignaturesOnly && !config.ExtractCode {
 		fmt.Println("Warning: --signatures-only requires --extract-code. Disabling signatures-only.")
 		config.SignaturesOnly = false
@@ -2483,6 +2870,8 @@ Usage: integrated_analyzer [OPTIONS]
 OPTIONS:
   --package, -p     Package name to analyze (required)
   --url, -u         OpenShift release URL
+  --repo-url URL    Analyze a single repository (skips scraping)
+  --repo-branch BR  Branch to use with --repo-url
   --output, -o      Output CSV filename
   --analyzer, -a    Path to Go analyzer binary
   --workers, -w     Number of concurrent workers (default: 4)
@@ -2502,6 +2891,7 @@ Examples:
   integrated_analyzer --package golang.org/x/crypto/ssh
   integrated_analyzer --package golang.org/x/crypto/ssh --workers 16
   integrated_analyzer --package golang.org/x/crypto/ssh --skip-analysis
+  integrated_analyzer --package golang.org/x/crypto/ssh --repo-url https://github.com/openshift/cluster-cloud-controller-manager-operator --repo-branch release-4.14
   integrated_analyzer --csv-only existing.csv --workers 12
   integrated_analyzer --package golang.org/x/crypto/ssh --output-dir ./crypto_analysis_results
   integrated_analyzer --csv-only existing.csv --extract-code  # Enable code extraction
